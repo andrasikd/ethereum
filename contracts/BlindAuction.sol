@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0
 pragma solidity ^0.8.4;
 
-contract BlindAuction {
+import { IERC721 } from "@openzeppelin/contracts/interfaces/IERC721.sol";
+import { IERC721Receiver } from "@openzeppelin/contracts/interfaces/IERC721Receiver.sol";
+
+contract BlindAuction is IERC721Receiver {
 
     address payable public beneficiary;
     uint public biddingEnd;
@@ -33,6 +36,7 @@ contract BlindAuction {
     error TooEarly(uint time);
     error TooLate(uint time);
     error AuctionEndAlreadyCalled();
+    error NotFunded();
 
     modifier onlyBefore(uint time) {
         if (block.timestamp >= time) revert TooLate(time);
@@ -40,6 +44,11 @@ contract BlindAuction {
     }
     modifier onlyAfter(uint time) {
         if (block.timestamp <= time) revert TooEarly(time);
+        _;
+    }
+
+    modifier onlyFunded(){
+        if(!funded()) revert NotFunded();
         _;
     }
 
@@ -67,8 +76,9 @@ contract BlindAuction {
     /// not the exact amount are ways to hide the real bid but
     /// still make the required deposit. The same address can
     /// place multiple bids.
-    function bid(bytes32 blindedBid) external payable onlyBefore(biddingEnd) {
-        
+    function bid(bytes32 blindedBid) external payable onlyBefore(biddingEnd) onlyFunded{
+        bids[msg.sender].push(Bid({blindedBid: blindedBid, deposit: msg.value}));
+        emit BidReceived(msg.sender, blindedBid, msg.value);
     }
 
     /// NEW: Reveal your blinded bids. You will get a refund for all
@@ -78,7 +88,7 @@ contract BlindAuction {
         uint[] calldata values,
         bool[] calldata fakes,
         bytes32[] calldata secrets
-    ) external onlyAfter(biddingEnd) onlyBefore(revealEnd) {
+    ) external onlyAfter(biddingEnd) onlyBefore(revealEnd) onlyFunded{
         uint length = bids[msg.sender].length;
         require(values.length == length);
         require(fakes.length == length);
@@ -87,6 +97,23 @@ contract BlindAuction {
         uint refund;
         for (uint i = 0; i < length; i++) {
             // TODO process bids
+            Bid storage bidToCheck = bids[msg.sender][i];
+            (uint value, bool fake, bytes32 secret) = (values[i], fakes[i], secrets[i]);
+            if (bidToCheck.blindedBid == keccak256(abi.encodePacked(value, fake, secret))) {
+                if(fake || bidToCheck.deposit < value){
+                    refund += bidToCheck.deposit;
+                } else {
+                    if(placeBid(msg.sender, value)){
+                        refund += bidToCheck.deposit - value;
+                    }
+                    else{
+                        refund += bidToCheck.deposit;
+                    }
+                }
+                emit RevealedBid(msg.sender, bidToCheck.blindedBid, fake, value);
+
+                bidToCheck.blindedBid = bytes32(0);
+            }
         }
         payable(msg.sender).transfer(refund);
     }
@@ -101,13 +128,13 @@ contract BlindAuction {
         }
     }
 
-    function auctionEnd() external onlyAfter(revealEnd) {
+    function auctionEnd() external onlyAfter(revealEnd) onlyFunded(){
         if (ended) revert AuctionEndAlreadyCalled();
+        emit AuctionEnded(highestBidder, highestBid);
 
         ended = true;
+        IERC721(tokenAddress).safeTransferFrom(address(this), highestBidder, tokenId);
         beneficiary.transfer(highestBid);
-
-        emit AuctionEnded(highestBidder, highestBid);
     }
 
     // NEW: The bid function was transformed into an internal function that will be called from the reveal function.
@@ -119,7 +146,10 @@ contract BlindAuction {
             return false;
         }
         
-        pendingReturns[highestBidder] += highestBid;
+        if (highestBidder != address(0)) {
+            // Refund the previously highest bidder.
+            pendingReturns[highestBidder] += highestBid;
+        }
         
         highestBid = value;
         highestBidder = bidder;
@@ -127,7 +157,13 @@ contract BlindAuction {
     }
 
     // NEW: Returns whether the auction has been funded (the NFT has been transferred to the contract).
-    function funded() external view returns (bool success) {
-        return false;
+    function funded() public view returns (bool success) {
+        return IERC721(tokenAddress).balanceOf(address(this)) >= 1;
+    }
+
+    function onERC721Received(address, address, uint256 _tokenId, bytes calldata) external view returns (bytes4) {
+        require(_tokenId == tokenId);
+        require(IERC721(tokenAddress).balanceOf(address(this)) >= 1);
+        return IERC721Receiver.onERC721Received.selector;
     }
 }
